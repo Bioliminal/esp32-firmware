@@ -146,6 +146,15 @@ void start_pulse_burst(uint8_t motor_idx, uint8_t duty, uint8_t n,
     Serial.println(" not wired");
     return;
   }
+  // Safety gate: only buzz during an Active session. Blocks phantom cues
+  // triggered by noise (e.g. unplugged electrodes) before the user has
+  // actually started a set.
+  if (gSessionState != Active) {
+    Serial.print("cmd: PULSE_BURST rejected, session not Active (state=");
+    Serial.print((int)gSessionState);
+    Serial.println(")");
+    return;
+  }
   if (n == 0) return;
 
   PulseBurst& b = gBurst[motor_idx];
@@ -210,7 +219,40 @@ void tick_pulse_schedulers() {
 // Command parsing
 // ---------------------------------------------------------------------------
 
+// Parseable Serial-capture row for every FF04 write. Format (stable, don't
+// reorder fields — captures/capture_ble_full.py parses this by regex):
+//   [rx] t_ms=<millis> len=<N> op=0x<HH> bytes=<HH HH HH ...>
+static void log_rx(const uint8_t* data, size_t len) {
+  Serial.print("[rx] t_ms=");
+  Serial.print(millis());
+  Serial.print(" len=");
+  Serial.print((uint32_t)len);
+  if (len >= 1) {
+    Serial.print(" op=0x");
+    if (data[0] < 0x10) Serial.print('0');
+    Serial.print(data[0], HEX);
+  }
+  Serial.print(" bytes=");
+  for (size_t i = 0; i < len; i++) {
+    if (i > 0) Serial.print(' ');
+    if (data[i] < 0x10) Serial.print('0');
+    Serial.print(data[i], HEX);
+  }
+  Serial.println();
+}
+
+// Session/connection boundaries in a matching parseable format.
+//   [evt] t_ms=<millis> kind=<name> [extra=...]
+static void log_evt(const char* kind) {
+  Serial.print("[evt] t_ms=");
+  Serial.print(millis());
+  Serial.print(" kind=");
+  Serial.println(kind);
+}
+
 void handle_command(const uint8_t* data, size_t len) {
+  log_rx(data, len);
+
   if (len == 0) return;
   uint8_t op = data[0];
 
@@ -236,8 +278,21 @@ void handle_command(const uint8_t* data, size_t len) {
       uint8_t s = data[1];
       if (s <= (uint8_t)Active) {
         gSessionState = (SessionState)s;
+        const char* name = (s == Idle ? "Idle" : s == Calibrating ? "Calibrating" : "Active");
         Serial.print("cmd: SET_SESSION_STATE -> ");
-        Serial.println(s == Idle ? "Idle" : s == Calibrating ? "Calibrating" : "Active");
+        Serial.println(name);
+        Serial.print("[evt] t_ms=");
+        Serial.print(millis());
+        Serial.print(" kind=session_state state=");
+        Serial.println(name);
+        // On transition to Idle: stop any running haptic and drain the ring
+        // buffer so a later Calibrating/Active start sees fresh samples.
+        if (gSessionState == Idle) {
+          for (int i = 0; i < MOTOR_COUNT; i++) stop_pulse_burst(i);
+          gRingHead = 0;
+          gRingTail = 0;
+          gClipFlags = 0;
+        }
       } else {
         Serial.print("cmd: SET_SESSION_STATE invalid state=");
         Serial.println(s);
@@ -271,12 +326,20 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {
     gConnected = true;
     Serial.println("BLE: connected");
+    log_evt("connect");
   }
   void onDisconnect(BLEServer*) override {
     gConnected = false;
     Serial.println("BLE: disconnected, re-advertising");
-    // Safety: stop any running haptic so a dropped phone doesn't leave the motor on.
+    log_evt("disconnect");
+    // Safety: stop any running haptic so a dropped phone doesn't leave the
+    // motor on, and force session back to Idle so sampling/streaming halt
+    // until the phone reconnects and re-asserts state.
     for (int i = 0; i < MOTOR_COUNT; i++) stop_pulse_burst(i);
+    gSessionState = Idle;
+    gRingHead = 0;
+    gRingTail = 0;
+    gClipFlags = 0;
     BLEDevice::startAdvertising();
   }
 };
@@ -383,12 +446,17 @@ void loop() {
   uint32_t now = micros();
   if ((int32_t)(now - next_sample_us) >= 0) {
     next_sample_us = now + SAMPLE_PERIOD_US;
-    sample_once();
+    // Sampling gate: only read the ADC when the phone has signalled an
+    // active or calibrating session. Idle = silent sensor, no bus noise
+    // feeding the phone's algorithm.
+    if (gSessionState != Idle) {
+      sample_once();
+    }
   }
 
   tick_pulse_schedulers();
 
-  if (gConnected && ring_count() >= SAMPLES_PER_PACKET) {
+  if (gConnected && gSessionState != Idle && ring_count() >= SAMPLES_PER_PACKET) {
     send_packet();
   }
 }
