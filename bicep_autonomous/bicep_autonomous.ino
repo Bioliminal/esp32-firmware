@@ -144,36 +144,58 @@ inline float env_avg() {
 }
 
 // ---------------------------------------------------------------------------
-// Calibration + fatigue (lifted from emg_fatigue.ino:105-124)
+// Calibration state. gCalibrationPeak is set during the 5 s Calibrating
+// window by tracking the envelope rolling-average max. It anchors the rep
+// detector's rise threshold. Fatigue scoring is done differently here than
+// in emg_fatigue.ino — see evaluate_fatigue_cue() below, which works from
+// per-rep peak history rather than instantaneous rolling-average drop.
 // ---------------------------------------------------------------------------
 
 float gCalibrationPeak = 0.0f;
 
-int compute_fatigue_pct(float avg, float peak) {
-  if (peak <= 1.0f) return 0;
-  float floorVal = 0.30f * peak;
-  if (avg >= peak)     return 0;
-  if (avg <= floorVal) return 100;
-  float drop  = peak - avg;
-  float range = peak - floorVal;
-  return (int)((drop / range) * 100.0f);
-}
-
 // ---------------------------------------------------------------------------
-// Rep detection — envelope peak state machine over the rolling ENV average.
-// rising  = avg >= 0.60 * peak
-// falling = avg <= 0.30 * peak
-// Count a rep on the falling -> quiet transition (one rep per up/down cycle).
-// 250 ms cooldown absorbs envelope wobble.
+// Rep detection — count at envelope peak (contraction apex), not at the end
+// of the eccentric release. Users subjectively count reps "as they squeeze,"
+// so firing the counter when avg has just turned over from a local max feels
+// synchronous with the motion.
+//
+// States:
+//   RepQuiet   — envelope below rise threshold (arm extended)
+//   RepRising  — envelope has crossed rise threshold; tracking running max
+//   RepCounted — peak detected (avg dropped ≥ 20% from running max); rep has
+//                been counted and we're just waiting for envelope to clear
+//                back below rise threshold so the next rep can start
+//
+// Per-rep peak envelope is recorded in gRepPeakHistory at the instant of the
+// count so downstream fatigue logic can compare rep N's peak against the
+// first N-1 peaks without re-walking the sample buffer.
 // ---------------------------------------------------------------------------
 
-enum RepPhase : uint8_t { RepQuiet = 0, RepRising = 1, RepFalling = 2 };
+enum RepPhase : uint8_t { RepQuiet = 0, RepRising = 1, RepCounted = 2 };
 RepPhase gRepPhase = RepQuiet;
 uint8_t  gRepCount = 0;
 uint32_t gLastRepMs = 0;
 const uint32_t REP_COOLDOWN_MS = 250;
-const float REP_RISE_FRAC = 0.60f;
-const float REP_FALL_FRAC = 0.30f;
+// Rep boundary detection. rise_thresh kicks the machine into "rising" on
+// the concentric phase; peak is declared when avg drops ≥ 20% from the
+// rising-phase max.
+const float REP_RISE_FRAC = 0.30f;
+const float REP_PEAK_DROP_FRAC = 0.80f;    // avg < this × running_max = peak
+
+float gCurrentRepPeak = 0.0f;
+const int REP_PEAK_HISTORY = 16;
+float gRepPeakHistory[REP_PEAK_HISTORY] = {0};
+
+// Fatigue cue evaluation — called once per rep boundary, not on a periodic
+// tick, so cues never fire during the quiet phase between reps. First cue is
+// gated to gRepCount ≥ CUE_START_REP, i.e. reps 1..CUE_START_REP are treated
+// as calibration reps on the firmware side.
+const uint8_t CUE_START_REP = 5;           // first cue possible at rep 6
+
+uint8_t gLastCueRep = 0;
+const uint8_t CUE_REP_COOLDOWN = 2;
+bool gCueEventFired = false;               // set when a burst starts
+void evaluate_fatigue_cue(uint32_t now_ms);
 
 void rep_detector_tick(uint32_t now_ms) {
   if (gSessionState != Active) return;
@@ -181,26 +203,43 @@ void rep_detector_tick(uint32_t now_ms) {
 
   float avg = env_avg();
   float rise_thresh = REP_RISE_FRAC * gCalibrationPeak;
-  float fall_thresh = REP_FALL_FRAC * gCalibrationPeak;
 
   switch (gRepPhase) {
     case RepQuiet:
-      if (avg >= rise_thresh) gRepPhase = RepRising;
+      if (avg >= rise_thresh) {
+        gRepPhase = RepRising;
+        gCurrentRepPeak = avg;
+      }
       break;
     case RepRising:
-      if (avg <= fall_thresh) gRepPhase = RepFalling;
-      break;
-    case RepFalling:
-      if (avg <= fall_thresh * 0.9f) {
-        // Confirmed dipped; count rep if cooldown met.
+      if (avg > gCurrentRepPeak) {
+        gCurrentRepPeak = avg;
+      }
+      // Declare peak when avg drops meaningfully from the running max AND
+      // the running max is comfortably above the rise threshold (avoids
+      // false positives from envelope noise that barely clears rise_thresh).
+      if (gCurrentRepPeak > 1.5f * rise_thresh &&
+          avg < REP_PEAK_DROP_FRAC * gCurrentRepPeak) {
         if (now_ms - gLastRepMs >= REP_COOLDOWN_MS) {
           gRepCount++;
           gLastRepMs = now_ms;
+          // Store this rep's peak into the history ring. Keyed by gRepCount
+          // so the most recent rep (index gRepCount - 1) is what fatigue
+          // evaluation reads.
+          gRepPeakHistory[(gRepCount - 1) % REP_PEAK_HISTORY] = gCurrentRepPeak;
           Serial.print("[rep] t_ms=");
           Serial.print(now_ms);
           Serial.print(" rep_count=");
-          Serial.println(gRepCount);
+          Serial.print(gRepCount);
+          Serial.print(" peak=");
+          Serial.println(gCurrentRepPeak, 1);
+          evaluate_fatigue_cue(now_ms);
         }
+        gRepPhase = RepCounted;
+      }
+      break;
+    case RepCounted:
+      if (avg < rise_thresh) {
         gRepPhase = RepQuiet;
       }
       break;
@@ -222,7 +261,6 @@ struct PulseBurst {
 };
 
 PulseBurst gBurst[MOTOR_COUNT] = {};
-bool gCueEventFired = false;   // set when a burst starts; cleared after next packet
 
 inline void motor_write(int idx, uint8_t duty) {
   if (idx < 0 || idx >= MOTOR_COUNT) return;
@@ -283,34 +321,45 @@ void tick_pulse_schedulers() {
 }
 
 // ---------------------------------------------------------------------------
-// Autonomous cue firing — maps fatigue pct to a pulse burst.  Cooldown is
-// enforced per-rep rather than per-time to align with the mobile side's
-// existing cue semantics ("at least 2 reps between autonomous cues").
+// Fatigue cue evaluation — called once per rep boundary from
+// rep_detector_tick(). Compares the most recent rep's peak envelope against
+// the baseline (mean of the first N cal-phase rep peaks). No periodic tick,
+// so cues never fire during the quiet phase between reps.
 // ---------------------------------------------------------------------------
 
-uint8_t gLastCueRep = 0;
-const uint8_t CUE_REP_COOLDOWN = 2;
-const uint32_t CUE_EVAL_INTERVAL_MS = 500;     // evaluate at most 2x/s
-uint32_t gLastCueEvalMs = 0;
-
-void autonomous_cue_tick(uint32_t now_ms) {
-  if (gSessionState != Active) return;
-  if (gRepCount < 1) return;                    // don't cue before first rep
-  if (now_ms - gLastCueEvalMs < CUE_EVAL_INTERVAL_MS) return;
-  gLastCueEvalMs = now_ms;
+void evaluate_fatigue_cue(uint32_t now_ms) {
+  // Gate: reps 1..CUE_START_REP act as calibration peaks. First cue possible
+  // starting at rep CUE_START_REP + 1 (so reps 1-5 collect baseline and the
+  // earliest cue fires at rep 6).
+  if (gRepCount <= CUE_START_REP) return;
   if (gRepCount - gLastCueRep < CUE_REP_COOLDOWN) return;
 
-  int pct = compute_fatigue_pct(env_avg(), gCalibrationPeak);
+  // Baseline = mean of the first CUE_START_REP peaks observed this session.
+  float baseline = 0.0f;
+  int baseline_n = 0;
+  for (int i = 0; i < CUE_START_REP && i < REP_PEAK_HISTORY; i++) {
+    if (gRepPeakHistory[i] > 1.0f) {
+      baseline += gRepPeakHistory[i];
+      baseline_n++;
+    }
+  }
+  if (baseline_n == 0) return;
+  baseline /= baseline_n;
+
+  float current = gRepPeakHistory[(gRepCount - 1) % REP_PEAK_HISTORY];
+  if (current >= baseline) return;   // no drop, nothing to cue
+
+  int pct = (int)((baseline - current) / baseline * 100.0f);
 
   uint8_t duty = 0, n = 0;
   uint16_t on_ms = 0, off_ms = 0;
-  if (pct < 20) {
-    return;
-  } else if (pct < 40) {                        // FADE
+  if (pct < 15) {
+    return;                          // below fade threshold
+  } else if (pct < 25) {              // FADE
     duty = 180; n = 2; on_ms = 200; off_ms = 150;
-  } else if (pct < 60) {                        // URGENT (medium)
+  } else if (pct < 50) {              // URGENT
     duty = 230; n = 2; on_ms = 200; off_ms = 150;
-  } else {                                      // STOP-like
+  } else {                            // STOP-like
     duty = 255; n = 3; on_ms = 100; off_ms = 80;
   }
 
@@ -319,7 +368,13 @@ void autonomous_cue_tick(uint32_t now_ms) {
 
   Serial.print("[cue] t_ms=");
   Serial.print(now_ms);
-  Serial.print(" fatigue_pct=");
+  Serial.print(" rep=");
+  Serial.print(gRepCount);
+  Serial.print(" peak=");
+  Serial.print(current, 1);
+  Serial.print(" baseline=");
+  Serial.print(baseline, 1);
+  Serial.print(" drop_pct=");
   Serial.print(pct);
   Serial.print(" duty=");
   Serial.print(duty);
@@ -378,6 +433,8 @@ void enter_idle() {
   gRepCount = 0;
   gLastCueRep = 0;
   gCueEventFired = false;
+  gCurrentRepPeak = 0.0f;
+  for (int i = 0; i < REP_PEAK_HISTORY; i++) gRepPeakHistory[i] = 0.0f;
   gCalibrationPeak = 0.0f;
   gEnvIdx = 0;
   gEnvSum = 0;
@@ -393,6 +450,8 @@ void enter_calibrating() {
   gRepPhase = RepQuiet;
   gRepCount = 0;
   gLastCueRep = 0;
+  gCurrentRepPeak = 0.0f;
+  for (int i = 0; i < REP_PEAK_HISTORY; i++) gRepPeakHistory[i] = 0.0f;
   log_session_state("Calibrating");
 }
 
@@ -591,7 +650,8 @@ void loop() {
 
   tick_pulse_schedulers();
   rep_detector_tick(now_ms);
-  autonomous_cue_tick(now_ms);
+  // Fatigue cues are fired from inside rep_detector_tick at each rep
+  // boundary — no periodic tick needed.
 
   if (gConnected && gSessionState != Idle && ring_count() >= SAMPLES_PER_PACKET) {
     send_packet();
