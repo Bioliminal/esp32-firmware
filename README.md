@@ -17,12 +17,14 @@ Full architecture and the phase-by-phase plan live at `../notes/` (see [related 
 | 1 — data capture | `emg_button_capture/emg_button_capture.ino` | **Button-triggered data logger.** Short-press BOOT to start session and mark reps; long-press to end. Streams 2 kHz CSV over Serial at 921600 baud. Pairs with `../captures/capture.sh`. |
 | 2 — realtime cueing | `bicep_realtime/bicep_realtime.ino` | **BLE production sketch.** Raw stream on FF02 + new FF04 command characteristic (`PULSE_BURST`, `STOP_HAPTIC`, `SET_SESSION_STATE`). Non-blocking pulse-burst scheduler supporting up to 4 motors. Auto-stops motors on BLE disconnect. |
 | 2 — realtime cueing | `bicep_hardware_test/bicep_hardware_test.ino` | **No-BLE bench twin of `bicep_realtime`.** Same pulse scheduler, triggered via BOOT button (FADE/URGENT) or Serial commands (`fade`/`urgent`/`form`/`pulse <args>`/`stop`). Lets you validate the motor + EMG pipeline without the phone. |
+| 3 — autonomous (hardware-led) | `bicep_autonomous/bicep_autonomous.ino` | **Hardware-led demo sketch.** Phone writes only `SET_SESSION_STATE(Calibrating)` / `SET_SESSION_STATE(Idle)`; firmware runs its own 5 s calibration, auto-advances to Active, counts reps locally from the ENV channel, and fires haptic cues autonomously on fatigue thresholds. Extends FF02 to **310 B** with `rep_count` + `cue_event` in the header. Pair with the app's `feat/hardware-led-read-only` branch. |
 
 ## Quick start
 
 - **Bench-test the motor + EMG without the app:** flash `bicep_hardware_test`. Open Serial Monitor at 115200, type `fade`, motor buzzes.
 - **Record an EMG dataset for offline analysis:** flash `emg_button_capture`, run `../captures/capture.sh <subject>`.
 - **Run the full Bioliminal Garment paired with the app:** flash `bicep_realtime`. See [`../notes/haptic-cueing-handshake.md`](../notes/haptic-cueing-handshake.md) for the BLE protocol and Phase 2 scope.
+- **Run the hardware-led demo:** flash `bicep_autonomous`. Pair the mobile app on `feat/hardware-led-read-only`. Phone only writes session boundaries; firmware owns rep counting, fatigue, and cue firing. See [`../notes/ble-flow.md`](../notes/ble-flow.md) for the autonomous-mode sequence.
 
 ## Hardware
 
