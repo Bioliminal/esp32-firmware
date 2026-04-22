@@ -25,6 +25,12 @@
 //   0x10 PULSE_BURST       [motor u8][duty u8][n u8][on_ms u16 LE][off_ms u16 LE]
 //   0x11 STOP_HAPTIC       [motor u8]
 //   0x12 SET_SESSION_STATE [state u8]   (0=Idle 1=Calibrating 2=Active, Serial logged)
+//   0x13 OP_REP_CONFIRMED  [rep_num u8][t_ms u24 LE]   (write-without-response;
+//        phone -> firmware reconciliation per the 2026-04-21 pose-authoritative
+//        rep-counting amendment. Firmware overwrites its local rep count and
+//        logs [rep-disagree] when local count differs by >1.
+//        See bioliminal-ops/operations/interface-contracts.md (IC-3) and
+//        bioliminal-ops/decisions/2026-04-21-pose-authoritative-rep-counting.md.)
 //
 // FF02 packet layout (unchanged from Phase 1):
 //   [0]      seq_num u8
