@@ -90,6 +90,17 @@ const int MOTOR_PINS[MOTOR_COUNT] = {25, -1, -1, -1};
 const int MOTOR_LEDC_FREQ_HZ   = 2000;
 const int MOTOR_LEDC_RES_BITS  = 8;
 
+// --- Motor pulse pattern ---
+// Defined here (not at first use below) because the Arduino `.ino`
+// preprocessor generates function prototypes at the top of the file;
+// any function returning `PulsePattern` would otherwise see its
+// prototype synthesized before the struct is declared.
+struct PulsePattern {
+  uint32_t onMs;
+  uint32_t offMs;
+  uint8_t  duty;   // 0-255
+};
+
 // --- Session state ---
 enum SessionState : uint8_t { Idle = 0, Calibrating = 1, Active = 2 };
 SessionState gSessionState = Idle;
@@ -298,11 +309,8 @@ void rep_detector_local_tick(uint32_t now_ms) {
 // so reps 1-5 stay silent.
 // ---------------------------------------------------------------------------
 
-struct PulsePattern {
-  uint32_t onMs;
-  uint32_t offMs;
-  uint8_t  duty;   // 0-255
-};
+// `PulsePattern` struct is declared near the top of the file (see
+// comment there about Arduino `.ino` prototype ordering).
 
 PulsePattern gCurrentPattern = {0, 0, 0};
 bool     gMotorPhaseOn   = false;
