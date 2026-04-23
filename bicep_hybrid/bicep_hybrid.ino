@@ -90,17 +90,6 @@ const int MOTOR_PINS[MOTOR_COUNT] = {25, -1, -1, -1};
 const int MOTOR_LEDC_FREQ_HZ   = 2000;
 const int MOTOR_LEDC_RES_BITS  = 8;
 
-// --- Motor pulse pattern ---
-// Defined here (not at first use below) because the Arduino `.ino`
-// preprocessor generates function prototypes at the top of the file;
-// any function returning `PulsePattern` would otherwise see its
-// prototype synthesized before the struct is declared.
-struct PulsePattern {
-  uint32_t onMs;
-  uint32_t offMs;
-  uint8_t  duty;   // 0-255
-};
-
 // --- Session state ---
 enum SessionState : uint8_t { Idle = 0, Calibrating = 1, Active = 2 };
 SessionState gSessionState = Idle;
@@ -302,60 +291,41 @@ void rep_detector_local_tick(uint32_t now_ms) {
 }
 
 // ---------------------------------------------------------------------------
-// Track A — continuous-gradient fatigue (ported from emg_fatigue.ino)
+// Haptic output — single-pulse buzz
 //
-// Drives motor 0 continuously based on how far env_avg has dropped from
-// gCalibrationPeak.  Gated on (Active && gRepCountConfirmed >= CUE_START_REP)
-// so reps 1-5 stay silent.
+// Per-rep-live-test feedback (2026-04-23, Rajat): continuous-gradient
+// Track A haptic was both distracting and the root cause of an "EMG not
+// reading after rep 5" symptom — the continuous motor PWM load on the
+// shared analog rail was biasing the MyoWare envelope readings.  Replaced
+// with a single-shot buzz fired on three events:
+//   • phone `OP_REP_CONFIRMED`       → short per-rep tap (synced with
+//                                      the pose-confirmed rep boundary)
+//   • `evaluate_fatigue_cue` fires   → longer / stronger tier-specific buzz
+//   • `enter_active` transition      → medium "session armed" buzz
+// Between buzzes the motor is idle, so the EMG front end stays clean.
 // ---------------------------------------------------------------------------
-
-// `PulsePattern` struct is declared near the top of the file (see
-// comment there about Arduino `.ino` prototype ordering).
-
-PulsePattern gCurrentPattern = {0, 0, 0};
-bool     gMotorPhaseOn   = false;
-uint32_t gMotorPhaseStart = 0;
-
-// fatigue % = how far env_avg has dropped from gCalibrationPeak.
-//   avg >= peak          ->   0%
-//   avg <= 0.30 * peak   -> 100%
-int compute_fatigue_pct(float avg, float peak) {
-  if (peak <= 1.0f) return 0;
-  float floorVal = 0.30f * peak;
-  if (avg >= peak)     return 0;
-  if (avg <= floorVal) return 100;
-  float drop  = peak - avg;
-  float range = peak - floorVal;
-  return (int)((drop / range) * 100.0f);
-}
-
-PulsePattern pattern_for_fatigue(int pct) {
-  if (pct < 20)  return {0,   0,   0};                         // off
-  if (pct < 40)  return {300, 700, (uint8_t)(0.40f * 255)};    // slow pulse
-  if (pct < 60)  return {200, 300, (uint8_t)(0.60f * 255)};    // medium
-  if (pct < 80)  return {100, 100, (uint8_t)(0.80f * 255)};    // fast
-  return               {500, 50,  255};                        // near-continuous
-}
 
 inline void motor0_write(uint8_t duty) {
   int pin = MOTOR_PINS[0];
   if (pin >= 0) ledcWrite(pin, duty);
 }
 
-void update_motor_continuous(uint32_t now) {
-  if (gCurrentPattern.duty == 0) {
-    motor0_write(0);
-    gMotorPhaseOn = false;
-    gMotorPhaseStart = now;
-    return;
-  }
+uint32_t gBuzzEndMs = 0;
+uint8_t  gBuzzDuty  = 0;
 
-  uint32_t phaseDur = gMotorPhaseOn ? gCurrentPattern.onMs : gCurrentPattern.offMs;
-  if (now - gMotorPhaseStart >= phaseDur) {
-    gMotorPhaseOn = !gMotorPhaseOn;
-    gMotorPhaseStart = now;
+void start_buzz(uint8_t duty, uint16_t duration_ms) {
+  if (duration_ms == 0) return;
+  gBuzzDuty = duty;
+  gBuzzEndMs = millis() + duration_ms;
+  motor0_write(duty);
+}
+
+void tick_buzz(uint32_t now_ms) {
+  if (gBuzzDuty == 0) return;
+  if ((int32_t)(now_ms - gBuzzEndMs) >= 0) {
+    motor0_write(0);
+    gBuzzDuty = 0;
   }
-  motor0_write(gMotorPhaseOn ? gCurrentPattern.duty : 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -403,10 +373,18 @@ void evaluate_fatigue_cue(uint32_t now_ms) {
   int drop_pct = (int)((baseline - current) / baseline * 100.0f);
 
   uint8_t kind = CUE_NONE;
-  if      (drop_pct >= 50) kind = CUE_FATIGUE_STOP;
-  else if (drop_pct >= 25) kind = CUE_FATIGUE_URGENT;
-  else if (drop_pct >= 15) kind = CUE_FATIGUE_FADE;
-  else return;
+  if (drop_pct >= 50) {
+    kind = CUE_FATIGUE_STOP;
+    start_buzz(255, 400);   // long strong burst — stop signal
+  } else if (drop_pct >= 25) {
+    kind = CUE_FATIGUE_URGENT;
+    start_buzz(240, 250);   // medium-strong burst — urgent
+  } else if (drop_pct >= 15) {
+    kind = CUE_FATIGUE_FADE;
+    start_buzz(210, 150);   // brief stronger tap — fade heads-up
+  } else {
+    return;
+  }
 
   gLastCueKind = kind;
   gLastCueRep  = gRepCountConfirmed;
@@ -466,8 +444,8 @@ static void log_session_state(const char* name) {
 void enter_idle() {
   gSessionState = Idle;
   motor0_write(0);
-  gCurrentPattern = {0, 0, 0};
-  gMotorPhaseOn = false;
+  gBuzzDuty = 0;
+  gBuzzEndMs = 0;
   gRingHead = 0;
   gRingTail = 0;
   gClipFlags = 0;
@@ -510,6 +488,7 @@ void enter_calibrating() {
 void enter_active() {
   gSessionState = Active;
   gLastCueKind = CUE_CALIBRATION_DONE;   // phone sees calibration_done on first packet after entry
+  start_buzz(150, 200);                   // medium "session armed" buzz
   log_session_state("Active");
 }
 
@@ -580,6 +559,17 @@ void handle_command(const uint8_t* data, size_t len) {
       gPeakSinceLastConfirm = 0.0f;
 
       evaluate_fatigue_cue(now_ms);
+
+      // Per-rep buzz — fires right at the pose-confirmed boundary so the
+      // user feels a tap in sync with the phone's rep count increment.
+      // A tier-specific fatigue buzz fired inside evaluate_fatigue_cue
+      // would have already overwritten gBuzzDuty/gBuzzEndMs, which is the
+      // desired precedence (fatigue > rep).  Light duty to keep motor
+      // current low and minimize EMG rail interference.
+      if (gSessionState == Active && gRepCountConfirmed >= CUE_START_REP &&
+          gBuzzDuty == 0) {
+        start_buzz(180, 80);
+      }
       break;
     }
 
@@ -789,15 +779,11 @@ void loop() {
   // fallback.  Phone-confirmed count is authoritative.
   rep_detector_local_tick(now_ms);
 
-  // Track A — continuous-gradient fatigue haptic.  Gated on Active state
-  // and at least CUE_START_REP confirmed reps (no haptic during calibration).
-  if (gSessionState == Active && gRepCountConfirmed >= CUE_START_REP) {
-    int fatigue_pct = compute_fatigue_pct(env_avg(), gCalibrationPeak);
-    gCurrentPattern = pattern_for_fatigue(fatigue_pct);
-  } else {
-    gCurrentPattern = {0, 0, 0};
-  }
-  update_motor_continuous(now_ms);
+  // Single-pulse buzz driver — auto-clears when the in-flight buzz's
+  // duration expires.  Started by OP_REP_CONFIRMED (per-rep tap),
+  // evaluate_fatigue_cue (tier-specific burst), and enter_active
+  // (session-armed pulse).
+  tick_buzz(now_ms);
 
   if (gConnected && gSessionState != Idle && ring_count() >= SAMPLES_PER_PACKET) {
     send_packet();
